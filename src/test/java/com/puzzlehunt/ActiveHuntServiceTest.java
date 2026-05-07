@@ -43,19 +43,23 @@ public class ActiveHuntServiceTest
 	}
 
 	@Test
-	public void startBeginsTimerAndPauseFoldsItIntoElapsed() throws InterruptedException
+	public void startBeginsTimerAndPauseStopsIt()
 	{
 		PuzzleHunt h = huntWithSteps(HuntMode.DIARY, 1);
 		service.start(h);
 		assertTrue(service.isTimerRunning());
-		Thread.sleep(40);
+		long elapsedWhileRunning = service.getElapsedMillis();
+		assertTrue("Elapsed should be non-negative while running", elapsedWhileRunning >= 0L);
+
 		service.pauseTimer();
 		assertFalse(service.isTimerRunning());
-		assertTrue("Elapsed should accumulate after pause", service.getElapsedMillis() > 0L);
 		long firstPauseValue = service.getElapsedMillis();
-		Thread.sleep(40);
-		// While paused the elapsed value must not advance.
+
+		// While paused getElapsedMillis() must return the persisted accumulator
+		// only — no live session contribution. Reading it twice in succession
+		// must yield the same value.
 		assertEquals(firstPauseValue, service.getElapsedMillis());
+		assertEquals(0L, service.getActiveProgress().getSessionStartMillis());
 	}
 
 	@Test

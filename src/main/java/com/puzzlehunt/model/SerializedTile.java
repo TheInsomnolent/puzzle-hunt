@@ -5,7 +5,7 @@ import lombok.Data;
 import lombok.NoArgsConstructor;
 
 /**
- * A serialisable world tile coordinate. Mirrors {@code WorldPoint} so the
+ * A serializable world tile coordinate. Mirrors {@code WorldPoint} so the
  * model package has no dependency on the RuneLite API.
  */
 @Data
