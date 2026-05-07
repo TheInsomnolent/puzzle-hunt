@@ -28,5 +28,8 @@ public class HuntProgress
 	/** Step id → split time (ms since hunt start). Insertion-ordered. */
 	private Map<String, Long> stepSplits = new LinkedHashMap<>();
 
+	/** Index of the next step to attempt in treasure-trail mode. Ignored in diary mode. */
+	private int currentStepIndex;
+
 	private boolean completed;
 }
