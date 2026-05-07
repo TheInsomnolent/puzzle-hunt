@@ -1,0 +1,6 @@
+# One example hunt resource per line, relative to this file.
+# Each referenced file should contain a single base64-encoded
+# puzzle hunt code (whitespace is ignored). Lines starting with
+# '#' and blank lines are skipped.
+cow31337killer.b64
+1000-xp-combat-challenge.b64
