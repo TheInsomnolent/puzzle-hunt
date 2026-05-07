@@ -4,7 +4,25 @@ package com.puzzlehunt.model;
 public enum LocationSubtype
 {
 	/** Completed by triggering the "Complete clue step" menu entry on a named NPC. */
-	NPC,
+	NPC("NPC"),
 	/** Completed by standing on one of the painted tiles. */
-	TILES
+	TILES("Tiles");
+
+	private final String displayName;
+
+	LocationSubtype(String displayName)
+	{
+		this.displayName = displayName;
+	}
+
+	public String getDisplayName()
+	{
+		return displayName;
+	}
+
+	@Override
+	public String toString()
+	{
+		return displayName;
+	}
 }

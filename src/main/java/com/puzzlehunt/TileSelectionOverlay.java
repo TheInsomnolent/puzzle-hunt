@@ -7,10 +7,7 @@ import java.awt.Color;
 import java.awt.Graphics2D;
 import java.awt.Polygon;
 import java.awt.Stroke;
-import java.util.ArrayList;
-import java.util.HashSet;
 import java.util.List;
-import java.util.Set;
 import javax.inject.Inject;
 import javax.inject.Singleton;
 import lombok.Setter;
@@ -18,66 +15,110 @@ import net.runelite.api.Client;
 import net.runelite.api.Perspective;
 import net.runelite.api.Player;
 import net.runelite.api.Scene;
+import net.runelite.api.WorldView;
 import net.runelite.api.coords.LocalPoint;
 import net.runelite.api.coords.WorldPoint;
 import net.runelite.client.ui.overlay.Overlay;
 import net.runelite.client.ui.overlay.OverlayLayer;
 import net.runelite.client.ui.overlay.OverlayPosition;
-import net.runelite.client.ui.overlay.OverlayPriority;
 
 /**
- * Renders painted tiles for the {@link PuzzleStep} currently being edited
- * (paint mode) or the active LOCATION_PUZZLE/TILES step in diary mode when
- * the player has chosen to reveal it.
+ * Renders, while a step is being edited:
+ * <ul>
+ *   <li>Each tile already saved on the step at low opacity ("valid
+ *       trigger" tiles).</li>
+ *   <li>Each tile sampled by the in-progress walk-loop, in a different
+ *       hue, so the user gets live feedback.</li>
+ * </ul>
  *
- * <p>To stay within the "no per-frame scene scans" guideline, the overlay
- * only iterates the configured tile list (typically &lt; 50 tiles) and
- * relies on RuneLite's culling at render time.
+ * <p>To stay within the "no per-frame scene scans" guideline, the
+ * overlay only iterates the configured tile lists (typically &lt; 200
+ * tiles) and relies on RuneLite's culling at render time.
  */
 @Singleton
 public class TileSelectionOverlay extends Overlay
 {
-	private static final Color FILL = new Color(0, 200, 255, 50);
-	private static final Color BORDER = new Color(0, 200, 255, 200);
-	private static final Stroke BORDER_STROKE = new BasicStroke(2f);
+	private static final Color VALID_FILL = new Color(0, 200, 255, 40);
+	private static final Color VALID_BORDER = new Color(0, 200, 255, 120);
+	private static final Color SAMPLE_FILL = new Color(255, 200, 0, 80);
+	private static final Color SAMPLE_BORDER = new Color(255, 200, 0, 220);
+	private static final Color START_FILL = new Color(60, 220, 90, 80);
+	private static final Color START_BORDER = new Color(60, 220, 90, 220);
+	private static final Stroke STROKE = new BasicStroke(1.5f);
 
 	private final Client client;
+	private final CompletionDetector detector;
 
-	/** Step being edited (paint mode); null disables rendering. */
+	/** Step being edited; null disables rendering. */
 	@Setter
-	private volatile PuzzleStep paintStep;
+	private volatile PuzzleStep editStep;
+
+	/** Starting tile for the hunt currently shown on the detail page; null hides it. */
+	@Setter
+	private volatile SerializedTile startingTile;
 
 	@Inject
-	TileSelectionOverlay(Client client)
+	TileSelectionOverlay(Client client, CompletionDetector detector)
 	{
 		this.client = client;
+		this.detector = detector;
 		setPosition(OverlayPosition.DYNAMIC);
 		setLayer(OverlayLayer.ABOVE_SCENE);
-		setPriority(OverlayPriority.MED);
+		setPriority(PRIORITY_MED);
 	}
 
 	@Override
 	public java.awt.Dimension render(Graphics2D g)
 	{
-		PuzzleStep step = paintStep;
-		if (step == null || step.getTiles() == null || step.getTiles().isEmpty())
+		PuzzleStep step = editStep;
+		SerializedTile start = startingTile;
+		if (step == null && start == null)
 		{
 			return null;
 		}
 		Player local = client.getLocalPlayer();
-		if (local == null)
+		WorldView wv = client.getTopLevelWorldView();
+		Scene scene = wv == null ? null : wv.getScene();
+		if (local == null || scene == null)
 		{
 			return null;
 		}
 		WorldPoint here = local.getWorldLocation();
-		Scene scene = client.getScene();
-		if (here == null || scene == null)
+		if (here == null)
 		{
 			return null;
 		}
-		int plane = client.getPlane();
-		g.setStroke(BORDER_STROKE);
-		for (SerializedTile t : step.getTiles())
+		int plane = wv.getPlane();
+		g.setStroke(STROKE);
+
+		if (start != null)
+		{
+			drawTiles(g, here, plane, java.util.Collections.singletonList(start), START_FILL, START_BORDER);
+		}
+
+		if (step != null)
+		{
+			// Saved valid-trigger tiles.
+			List<SerializedTile> tiles = step.getTiles();
+			if (tiles != null)
+			{
+				drawTiles(g, here, plane, tiles, VALID_FILL, VALID_BORDER);
+			}
+
+			// Live walk-loop samples (only for the step currently being captured).
+			if (detector.getSampleStep() == step)
+			{
+				List<SerializedTile> samples = detector.getSampleBuffer();
+				drawTiles(g, here, plane, samples, SAMPLE_FILL, SAMPLE_BORDER);
+			}
+		}
+		return null;
+	}
+
+	private void drawTiles(Graphics2D g, WorldPoint here, int plane,
+		List<SerializedTile> tiles, Color fill, Color border)
+	{
+		for (SerializedTile t : tiles)
 		{
 			if (t.getPlane() != plane)
 			{
@@ -98,45 +139,10 @@ public class TileSelectionOverlay extends Overlay
 			{
 				continue;
 			}
-			g.setColor(FILL);
+			g.setColor(fill);
 			g.fillPolygon(poly);
-			g.setColor(BORDER);
+			g.setColor(border);
 			g.drawPolygon(poly);
 		}
-		return null;
-	}
-
-	/** Toggles a world tile in/out of the painted set. */
-	public static synchronized void toggleTile(PuzzleStep step, WorldPoint wp)
-	{
-		if (step == null || wp == null)
-		{
-			return;
-		}
-		List<SerializedTile> tiles = step.getTiles();
-		if (tiles == null)
-		{
-			tiles = new ArrayList<>();
-			step.setTiles(tiles);
-		}
-		Set<Long> existing = new HashSet<>();
-		for (SerializedTile t : tiles)
-		{
-			existing.add(key(t.getX(), t.getY(), t.getPlane()));
-		}
-		long k = key(wp.getX(), wp.getY(), wp.getPlane());
-		if (existing.contains(k))
-		{
-			tiles.removeIf(t -> key(t.getX(), t.getY(), t.getPlane()) == k);
-		}
-		else
-		{
-			tiles.add(new SerializedTile(wp.getX(), wp.getY(), wp.getPlane()));
-		}
-	}
-
-	private static long key(int x, int y, int plane)
-	{
-		return (((long) plane) << 60) | (((long) x) << 30) | (long) y;
 	}
 }

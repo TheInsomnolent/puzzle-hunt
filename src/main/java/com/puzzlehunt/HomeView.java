@@ -8,23 +8,22 @@ import java.awt.Color;
 import java.awt.Component;
 import java.awt.Dimension;
 import java.awt.GridLayout;
+import java.awt.Toolkit;
+import java.awt.datatransfer.Clipboard;
+import java.awt.datatransfer.DataFlavor;
+import java.awt.datatransfer.UnsupportedFlavorException;
 import java.awt.event.MouseAdapter;
 import java.awt.event.MouseEvent;
 import java.io.IOException;
-import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
 import java.util.Map;
 import javax.swing.BorderFactory;
 import javax.swing.Box;
 import javax.swing.BoxLayout;
 import javax.swing.JButton;
-import javax.swing.JFileChooser;
 import javax.swing.JLabel;
 import javax.swing.JOptionPane;
 import javax.swing.JPanel;
-import javax.swing.JScrollPane;
 import javax.swing.SwingConstants;
-import javax.swing.filechooser.FileNameExtensionFilter;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.client.ui.ColorScheme;
 
@@ -43,28 +42,14 @@ class HomeView extends JPanel
 
 		add(buildHeader(), BorderLayout.NORTH);
 
-		JPanel buttons = new JPanel(new GridLayout(3, 1, 0, 4));
+		JPanel buttons = new JPanel(new GridLayout(2, 1, 0, 4));
 		buttons.setBackground(ColorScheme.DARK_GRAY_COLOR);
-		JButton create = new JButton("Create new hunt");
+		JButton create = PanelComponents.button("Create new hunt");
 		create.addActionListener(e -> host.showCreate(null));
 		buttons.add(create);
-		JButton importBtn = new JButton("Import from JSON…");
+		JButton importBtn = PanelComponents.button("Import from clipboard");
 		importBtn.addActionListener(e -> onImport());
 		buttons.add(importBtn);
-		JButton resume = new JButton("Resume active hunt");
-		resume.addActionListener(e ->
-		{
-			if (host.getActive().getActiveHunt() != null)
-			{
-				host.showActive();
-			}
-			else
-			{
-				JOptionPane.showMessageDialog(this, "No hunt is currently active. Pick one from the list below.",
-					"Puzzle hunt", JOptionPane.INFORMATION_MESSAGE);
-			}
-		});
-		buttons.add(resume);
 
 		JPanel center = new JPanel(new BorderLayout(0, 8));
 		center.setBackground(ColorScheme.DARK_GRAY_COLOR);
@@ -72,10 +57,7 @@ class HomeView extends JPanel
 
 		huntList.setLayout(new BoxLayout(huntList, BoxLayout.Y_AXIS));
 		huntList.setBackground(ColorScheme.DARK_GRAY_COLOR);
-		JScrollPane sp = new JScrollPane(huntList);
-		sp.setBorder(BorderFactory.createEmptyBorder());
-		sp.getViewport().setBackground(ColorScheme.DARK_GRAY_COLOR);
-		center.add(sp, BorderLayout.CENTER);
+		center.add(huntList, BorderLayout.CENTER);
 
 		add(center, BorderLayout.CENTER);
 	}
@@ -148,20 +130,37 @@ class HomeView extends JPanel
 
 	private void onImport()
 	{
-		JFileChooser chooser = new JFileChooser();
-		chooser.setDialogTitle("Import puzzle hunt");
-		chooser.setFileFilter(new FileNameExtensionFilter("Puzzle hunt JSON (*.json)", "json"));
-		if (chooser.showOpenDialog(this) != JFileChooser.APPROVE_OPTION)
+		String code;
+		try
 		{
+			Clipboard cb = Toolkit.getDefaultToolkit().getSystemClipboard();
+			if (cb == null || !cb.isDataFlavorAvailable(DataFlavor.stringFlavor))
+			{
+				JOptionPane.showMessageDialog(this, "Clipboard does not contain text.",
+					"Puzzle hunt", JOptionPane.WARNING_MESSAGE);
+				return;
+			}
+			code = (String) cb.getData(DataFlavor.stringFlavor);
+		}
+		catch (IllegalStateException | UnsupportedFlavorException | IOException ex)
+		{
+			log.debug("Failed to read clipboard", ex);
+			JOptionPane.showMessageDialog(this, "Could not read clipboard: " + ex.getMessage(),
+				"Puzzle hunt", JOptionPane.ERROR_MESSAGE);
+			return;
+		}
+		if (code == null || code.trim().isEmpty())
+		{
+			JOptionPane.showMessageDialog(this, "Clipboard is empty.",
+				"Puzzle hunt", JOptionPane.WARNING_MESSAGE);
 			return;
 		}
 		try
 		{
-			String json = new String(Files.readAllBytes(chooser.getSelectedFile().toPath()), StandardCharsets.UTF_8);
-			host.getHuntManager().importHunt(json);
+			host.getHuntManager().importHunt(code.trim());
 			refresh();
 		}
-		catch (IOException ex)
+		catch (IOException | IllegalArgumentException ex)
 		{
 			log.debug("Failed to import hunt", ex);
 			JOptionPane.showMessageDialog(this, "Could not import hunt: " + ex.getMessage(),

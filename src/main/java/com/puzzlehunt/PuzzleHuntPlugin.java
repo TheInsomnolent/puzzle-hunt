@@ -35,6 +35,8 @@ public class PuzzleHuntPlugin extends Plugin
 	@Inject private ActiveHuntService active;
 	@Inject private CompletionDetector detector;
 	@Inject private TileSelectionOverlay tileOverlay;
+	@Inject private CountdownOverlay countdownOverlay;
+	@Inject private HuntManager huntManager;
 
 	private NavigationButton navButton;
 
@@ -43,8 +45,11 @@ public class PuzzleHuntPlugin extends Plugin
 	{
 		log.debug("Puzzle Hunt starting up");
 
+		huntManager.bootstrapExampleHuntsIfNeeded();
+
 		eventBus.register(detector);
 		overlayManager.add(tileOverlay);
+		overlayManager.add(countdownOverlay);
 
 		final BufferedImage icon = ImageUtil.loadImageResource(getClass(), ICON_RESOURCE);
 		navButton = NavigationButton.builder()
@@ -70,6 +75,7 @@ public class PuzzleHuntPlugin extends Plugin
 		active.pauseTimer();
 		eventBus.unregister(detector);
 		overlayManager.remove(tileOverlay);
+		overlayManager.remove(countdownOverlay);
 		if (navButton != null)
 		{
 			clientToolbar.removeNavigation(navButton);

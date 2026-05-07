@@ -5,32 +5,39 @@ import com.puzzlehunt.model.ItemSource;
 import com.puzzlehunt.model.LocationSubtype;
 import com.puzzlehunt.model.PuzzleStep;
 import com.puzzlehunt.model.SerializedTile;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import javax.inject.Inject;
 import javax.inject.Singleton;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
-import net.runelite.api.InventoryID;
 import net.runelite.api.Item;
 import net.runelite.api.ItemContainer;
-import net.runelite.api.MenuAction;
-import net.runelite.api.MenuEntry;
 import net.runelite.api.NPC;
 import net.runelite.api.Player;
+import net.runelite.api.Skill;
+import net.runelite.api.coords.WorldArea;
 import net.runelite.api.coords.WorldPoint;
+import net.runelite.api.events.ActorDeath;
 import net.runelite.api.events.GameTick;
 import net.runelite.api.events.ItemContainerChanged;
-import net.runelite.api.events.MenuEntryAdded;
 import net.runelite.api.events.MenuOptionClicked;
+import net.runelite.api.events.StatChanged;
+import net.runelite.api.gameval.InterfaceID;
+import net.runelite.api.gameval.InventoryID;
+import net.runelite.api.gameval.ItemID;
+import net.runelite.api.widgets.Widget;
+import net.runelite.client.callback.ClientThread;
 import net.runelite.client.eventbus.Subscribe;
 import net.runelite.client.events.NpcLootReceived;
 
 /**
- * Wires game events to the active hunt and the eyedropper.
+ * Wires game events to the active hunt and the tile-walk capture flow.
  *
  * <p>Adds RuneLite-only menu entries — these never go to the server, so they
  * comply with the "no menu entries that send actions" hub guideline.
@@ -40,167 +47,97 @@ import net.runelite.client.events.NpcLootReceived;
 public class CompletionDetector
 {
 	private static final String TAKE_OPTION = "Take";
-	private static final String COMPLETE_CLUE_OPTION = "Complete clue step";
-	private static final String SELECT_OPTION_PREFIX = "Puzzle hunt: select ";
 
 	private final Client client;
+	private final ClientThread clientThread;
 	private final ActiveHuntService active;
-	private final EyedropperService eyedropper;
 
 	/** Per-item baseline counts in the inventory, used to detect gains. */
 	private final Map<Integer, Integer> lastInventoryCounts = new HashMap<>();
 
-	/** Step currently in tile-paint mode, or null. */
-	private volatile PuzzleStep paintStep;
-	private volatile Runnable onPaintChanged;
+	/** Per-step running totals for accumulator-style steps (item count, kc, gp, xp). */
+	private final Map<String, Integer> stepCounters = new HashMap<>();
 
-	public synchronized void setPaintStep(PuzzleStep step, Runnable onChanged)
-	{
-		this.paintStep = step;
-		this.onPaintChanged = onChanged;
-	}
+	/** Per-step baseline XP totals captured when the step first becomes active. */
+	private final Map<String, Map<Skill, Integer>> stepXpBaselines = new HashMap<>();
 
-	public synchronized PuzzleStep getPaintStep()
-	{
-		return paintStep;
-	}
+	/** Tracks whether the active hunt's timer was running on the last XP event. */
+	private boolean wasTimerRunning;
+
+	/** Set when a skilling XP drop arrives; cleared on the next game tick. Used
+	 * to disambiguate skilling-sourced inventory gains from bank/shop withdrawals. */
+	private volatile boolean skillingThisTick;
+
+	/**
+	 * Step currently in walk-loop sampling mode, or null. Player tiles
+	 * are appended to {@link #sampleBuffer} every game tick while set;
+	 * the overlay shows them at low opacity for live feedback.
+	 */
+	private volatile PuzzleStep sampleStep;
+	private final List<SerializedTile> sampleBuffer = new ArrayList<>();
+	private volatile Runnable onSampleChanged;
 
 	@Inject
-	CompletionDetector(Client client, ActiveHuntService active, EyedropperService eyedropper)
+	CompletionDetector(Client client, ClientThread clientThread, ActiveHuntService active)
 	{
 		this.client = client;
+		this.clientThread = clientThread;
 		this.active = active;
-		this.eyedropper = eyedropper;
 	}
 
 	// ------------------------------------------------------------------
-	// Menu entry adapter
+	// Walk-loop sampling
 	// ------------------------------------------------------------------
 
-	@Subscribe
-	public void onMenuEntryAdded(MenuEntryAdded event)
+	/** Begin sampling player tiles for {@code step}. */
+	public synchronized void startSampling(PuzzleStep step, Runnable onChanged)
 	{
-		EyedropperService.Mode mode = eyedropper.getMode();
-
-		// Tile-paint mode: attach a "Paint tile" / "Unpaint tile" entry to "Walk here".
-		PuzzleStep ps = paintStep;
-		if (ps != null && "Walk here".equals(event.getOption()))
-		{
-			final int sx = event.getMenuEntry().getParam0();
-			final int sy = event.getMenuEntry().getParam1();
-			final int plane = client.getPlane();
-			WorldPoint wp = WorldPoint.fromScene(client, sx, sy, plane);
-			if (wp != null)
-			{
-				boolean already = false;
-				if (ps.getTiles() != null)
-				{
-					for (SerializedTile t : ps.getTiles())
-					{
-						if (t.getX() == wp.getX() && t.getY() == wp.getY() && t.getPlane() == wp.getPlane())
-						{
-							already = true;
-							break;
-						}
-					}
-				}
-				final WorldPoint capturedWp = wp;
-				addRuneliteEntry(already ? "Unpaint tile" : "Paint tile", e ->
-				{
-					TileSelectionOverlay.toggleTile(ps, capturedWp);
-					Runnable cb = onPaintChanged;
-					if (cb != null)
-					{
-						cb.run();
-					}
-				});
-			}
-		}
-
-		if (mode == EyedropperService.Mode.ITEM_FROM_INVENTORY && isInventoryEntry(event))
-		{
-			MenuEntry me = event.getMenuEntry();
-			int itemId = me.getItemId();
-			if (itemId > 0)
-			{
-				addRuneliteEntry(SELECT_OPTION_PREFIX + "item", e -> eyedropper.provide(new SelectedItem(itemId, safeName(me.getTarget()))));
-			}
-		}
-
-		if ((mode == EyedropperService.Mode.NPC || mode == EyedropperService.Mode.MONSTER) && isNpcEntry(event))
-		{
-			NPC npc = event.getMenuEntry().getNpc();
-			if (npc != null)
-			{
-				int id = npc.getId();
-				String name = npc.getName() == null ? "" : npc.getName();
-				addRuneliteEntry(SELECT_OPTION_PREFIX + (mode == EyedropperService.Mode.MONSTER ? "monster" : "NPC"),
-					e -> eyedropper.provide(new SelectedNpc(id, name)));
-			}
-		}
-
-		// "Complete clue step" entries on matching NPCs while a hunt is active
-		if (isNpcEntry(event))
-		{
-			NPC npc = event.getMenuEntry().getNpc();
-			if (npc != null && shouldOfferCompleteClueOn(npc))
-			{
-				addRuneliteEntry(COMPLETE_CLUE_OPTION, e ->
-				{
-					List<PuzzleStep> watching = active.getActiveStepsForDetection();
-					String npcName = npc.getName() == null ? "" : npc.getName();
-					for (PuzzleStep s : watching)
-					{
-						if (s.getType() == ClueType.LOCATION_PUZZLE
-							&& s.getLocationSubtype() == LocationSubtype.NPC
-							&& npcName.equalsIgnoreCase(s.getNpcName()))
-						{
-							active.completeStep(s.getId());
-							return;
-						}
-					}
-				});
-			}
-		}
+		this.sampleStep = step;
+		this.onSampleChanged = onChanged;
+		this.sampleBuffer.clear();
 	}
 
-	private boolean shouldOfferCompleteClueOn(NPC npc)
+	/**
+	 * Stop sampling and write the convex-hull-filled tile set onto the
+	 * step. Returns null if no sampling was in progress.
+	 */
+	public synchronized PuzzleStep finishSampling()
 	{
-		if (npc.getName() == null)
+		PuzzleStep step = this.sampleStep;
+		if (step == null)
 		{
-			return false;
+			return null;
 		}
-		String name = npc.getName();
-		for (PuzzleStep s : active.getActiveStepsForDetection())
+		List<SerializedTile> filled = TileHull.hullFill(new ArrayList<>(sampleBuffer));
+		step.setTiles(filled);
+		this.sampleStep = null;
+		this.sampleBuffer.clear();
+		Runnable cb = this.onSampleChanged;
+		this.onSampleChanged = null;
+		if (cb != null)
 		{
-			if (s.getType() == ClueType.LOCATION_PUZZLE
-				&& s.getLocationSubtype() == LocationSubtype.NPC
-				&& name.equalsIgnoreCase(s.getNpcName()))
-			{
-				return true;
-			}
+			cb.run();
 		}
-		return false;
+		return step;
 	}
 
-	private boolean isInventoryEntry(MenuEntryAdded event)
+	/** Cancel sampling without committing tiles to the step. */
+	public synchronized void cancelSampling()
 	{
-		// itemId is set on inventory item menu entries; combined with a non-NPC target this is a safe heuristic.
-		return event.getMenuEntry().getItemId() > 0 && event.getMenuEntry().getNpc() == null;
+		this.sampleStep = null;
+		this.sampleBuffer.clear();
+		this.onSampleChanged = null;
 	}
 
-	private boolean isNpcEntry(MenuEntryAdded event)
+	public PuzzleStep getSampleStep()
 	{
-		return event.getMenuEntry().getNpc() != null;
+		return sampleStep;
 	}
 
-	private void addRuneliteEntry(String option, java.util.function.Consumer<MenuEntry> onClick)
+	/** Live snapshot of buffered samples, for the overlay to render. */
+	synchronized List<SerializedTile> getSampleBuffer()
 	{
-		client.getMenu().createMenuEntry(-1)
-			.setOption(option)
-			.setTarget("")
-			.setType(MenuAction.RUNELITE)
-			.onClick(onClick);
+		return new ArrayList<>(sampleBuffer);
 	}
 
 	// ------------------------------------------------------------------
@@ -224,9 +161,9 @@ public class CompletionDetector
 		{
 			if (s.getType() == ClueType.GET_ITEM
 				&& s.getItemSource() == ItemSource.GROUND_SPAWN
-				&& s.getItemId() == itemId)
+				&& itemMatches(s, itemId))
 			{
-				active.completeStep(s.getId());
+				accumulateItem(s, 1);
 				return;
 			}
 		}
@@ -239,7 +176,7 @@ public class CompletionDetector
 	@Subscribe
 	public void onItemContainerChanged(ItemContainerChanged event)
 	{
-		if (event.getContainerId() != InventoryID.INVENTORY.getId())
+		if (event.getContainerId() != InventoryID.INV)
 		{
 			return;
 		}
@@ -247,26 +184,104 @@ public class CompletionDetector
 		Map<Integer, Integer> current = countItems(inv);
 
 		List<PuzzleStep> watching = active.getActiveStepsForDetection();
+		boolean bankOrShopOpen = isBankOpen() || isShopOpen();
+		boolean skilledThisTick = skillingThisTick;
+
+		// GP gain detection (coin stack delta).
+		int coinPrev = lastInventoryCounts.getOrDefault(ItemID.COINS, 0);
+		int coinNow = current.getOrDefault(ItemID.COINS, 0);
+		int coinDelta = coinNow - coinPrev;
+
 		for (PuzzleStep s : watching)
 		{
-			if (s.getType() != ClueType.GET_ITEM || s.getItemSource() != ItemSource.ANY)
+			if (s.getType() == ClueType.GAIN_GP)
+			{
+				if (coinDelta > 0 && s.getGpAmount() > 0)
+				{
+					int accum = stepCounters.getOrDefault(s.getId(), 0) + coinDelta;
+					stepCounters.put(s.getId(), accum);
+					if (accum >= s.getGpAmount())
+					{
+						active.completeStep(s.getId());
+					}
+				}
+				continue;
+			}
+			if (s.getType() != ClueType.GET_ITEM)
 			{
 				continue;
 			}
-			int id = s.getItemId();
-			if (id <= 0)
+			ItemSource src = s.getItemSource();
+			if (src != ItemSource.ANY && src != ItemSource.SKILLING_RESOURCE)
+			{
+				// MONSTER_DROP / GROUND_SPAWN are handled elsewhere.
+				continue;
+			}
+			int gained = totalGain(s, current);
+			if (gained <= 0)
 			{
 				continue;
 			}
+			if (src == ItemSource.SKILLING_RESOURCE)
+			{
+				if (!skilledThisTick || bankOrShopOpen)
+				{
+					continue;
+				}
+			}
+			accumulateItem(s, gained);
+		}
+		lastInventoryCounts.clear();
+		lastInventoryCounts.putAll(current);
+	}
+
+	/** Returns the total gain (across all valid item ids) since the last snapshot. */
+	private int totalGain(PuzzleStep s, Map<Integer, Integer> current)
+	{
+		int gained = 0;
+		for (int id : validItemIds(s))
+		{
 			int now = current.getOrDefault(id, 0);
 			int prev = lastInventoryCounts.getOrDefault(id, 0);
 			if (now > prev)
 			{
-				active.completeStep(s.getId());
+				gained += (now - prev);
 			}
 		}
-		lastInventoryCounts.clear();
-		lastInventoryCounts.putAll(current);
+		return gained;
+	}
+
+	private static java.util.Set<Integer> validItemIds(PuzzleStep s)
+	{
+		java.util.Set<Integer> ids = new HashSet<>();
+		if (s.getItemId() > 0)
+		{
+			ids.add(s.getItemId());
+		}
+		if (s.getAdditionalItemIds() != null)
+		{
+			for (Integer id : s.getAdditionalItemIds())
+			{
+				if (id != null && id > 0) ids.add(id);
+			}
+		}
+		return ids;
+	}
+
+	private static boolean itemMatches(PuzzleStep s, int itemId)
+	{
+		return validItemIds(s).contains(itemId);
+	}
+
+	private void accumulateItem(PuzzleStep s, int gained)
+	{
+		int required = Math.max(1, s.getRequiredCount());
+		int accum = stepCounters.getOrDefault(s.getId(), 0) + gained;
+		stepCounters.put(s.getId(), accum);
+		if (accum >= required)
+		{
+			active.completeStep(s.getId());
+		}
 	}
 
 	private Map<Integer, Integer> countItems(ItemContainer inv)
@@ -299,29 +314,97 @@ public class CompletionDetector
 		{
 			return;
 		}
-		int npcId = npc.getId();
+		String npcName = npc.getName() == null ? "" : npc.getName();
 		Set<Integer> droppedIds = new HashSet<>();
 		event.getItems().forEach(stack -> droppedIds.add(stack.getId()));
 
 		for (PuzzleStep s : active.getActiveStepsForDetection())
 		{
-			if (s.getType() != ClueType.GET_ITEM || s.getItemSource() != ItemSource.MONSTER_DROP)
+			// MONSTER_DROP — must drop one of the configured items from a matching monster.
+			if (s.getType() == ClueType.GET_ITEM && s.getItemSource() == ItemSource.MONSTER_DROP)
 			{
-				continue;
+				if (!nameMatchesAny(npcName, s.getMonsterNames())) continue;
+				int matched = 0;
+				for (Integer id : validItemIds(s))
+				{
+					if (droppedIds.contains(id)) matched++;
+				}
+				if (matched > 0)
+				{
+					accumulateItem(s, matched);
+				}
 			}
-			if (s.getMonsterIds() != null && !s.getMonsterIds().isEmpty() && !s.getMonsterIds().contains(npcId))
+			// KILL_MONSTER — just count the kill.
+			else if (s.getType() == ClueType.KILL_MONSTER)
 			{
-				continue;
+				if (!nameMatchesAny(npcName, s.getKillMonsterNames())) continue;
+				int required = Math.max(1, s.getKillCount());
+				int accum = stepCounters.getOrDefault(s.getId(), 0) + 1;
+				stepCounters.put(s.getId(), accum);
+				if (accum >= required)
+				{
+					active.completeStep(s.getId());
+				}
 			}
-			if (droppedIds.contains(s.getItemId()))
+		}
+	}
+
+	@Subscribe
+	public void onActorDeath(ActorDeath event)
+	{
+		if (event.getActor() != client.getLocalPlayer())
+		{
+			return;
+		}
+		for (PuzzleStep s : active.getActiveStepsForDetection())
+		{
+			if (s.getType() == ClueType.DIE)
 			{
 				active.completeStep(s.getId());
 			}
 		}
 	}
 
+	/** Player input from the active panel for {@link ClueType#PASSWORD} steps. */
+	public boolean submitPassword(String stepId, String text)
+	{
+		if (stepId == null || text == null) return false;
+		for (PuzzleStep s : active.getActiveStepsForDetection())
+		{
+			if (!stepId.equals(s.getId())) continue;
+			if (s.getType() != ClueType.PASSWORD) return false;
+			String want = s.getPasswordAnswer() == null ? "" : s.getPasswordAnswer().trim();
+			if (!want.isEmpty() && want.equalsIgnoreCase(text.trim()))
+			{
+				active.completeStep(s.getId());
+				return true;
+			}
+			return false;
+		}
+		return false;
+	}
+
+	private static boolean nameMatchesAny(String npcName, List<String> configured)
+	{
+		if (configured == null || configured.isEmpty())
+		{
+			// Empty list = any monster counts.
+			return true;
+		}
+		String lower = npcName.toLowerCase(Locale.ROOT);
+		for (String n : configured)
+		{
+			if (n == null || n.trim().isEmpty()) continue;
+			if (lower.equals(n.trim().toLowerCase(Locale.ROOT)))
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
 	// ------------------------------------------------------------------
-	// Tile detection for LOCATION_PUZZLE / TILES
+	// Per-tick handling: tile completion + walk-loop sampling
 	// ------------------------------------------------------------------
 
 	@Subscribe
@@ -337,61 +420,211 @@ public class CompletionDetector
 		{
 			return;
 		}
+
+		// Walk-loop sampling: append the current tile if it's new.
+		PuzzleStep capturing = sampleStep;
+		if (capturing != null)
+		{
+			Runnable notify = null;
+			synchronized (this)
+			{
+				boolean already = false;
+				for (SerializedTile t : sampleBuffer)
+				{
+					if (t.getX() == pos.getX() && t.getY() == pos.getY() && t.getPlane() == pos.getPlane())
+					{
+						already = true;
+						break;
+					}
+				}
+				if (!already)
+				{
+					sampleBuffer.add(new SerializedTile(pos.getX(), pos.getY(), pos.getPlane()));
+					notify = onSampleChanged;
+				}
+			}
+			if (notify != null)
+			{
+				notify.run();
+			}
+		}
+
+		// Tile completion for active LOCATION_PUZZLE / TILES steps,
+		// plus NPC adjacency for LOCATION_PUZZLE / NPC steps.
+		WorldArea playerArea = local.getWorldArea();
 		for (PuzzleStep s : active.getActiveStepsForDetection())
 		{
-			if (s.getType() != ClueType.LOCATION_PUZZLE || s.getLocationSubtype() != LocationSubtype.TILES)
+			if (s.getType() != ClueType.LOCATION_PUZZLE)
 			{
 				continue;
 			}
-			List<SerializedTile> tiles = s.getTiles();
-			if (tiles == null || tiles.isEmpty())
+			if (s.getLocationSubtype() == LocationSubtype.TILES)
 			{
-				continue;
+				List<SerializedTile> tiles = s.getTiles();
+				if (tiles == null || tiles.isEmpty())
+				{
+					continue;
+				}
+				for (SerializedTile t : tiles)
+				{
+					if (t.getX() == pos.getX() && t.getY() == pos.getY() && t.getPlane() == pos.getPlane())
+					{
+						active.completeStep(s.getId());
+						break;
+					}
+				}
 			}
-			for (SerializedTile t : tiles)
+			else if (s.getLocationSubtype() == LocationSubtype.NPC && playerArea != null)
 			{
-				if (t.getX() == pos.getX() && t.getY() == pos.getY() && t.getPlane() == pos.getPlane())
+				String want = s.getNpcName();
+				if (want == null || want.trim().isEmpty())
+				{
+					continue;
+				}
+				for (NPC npc : client.getTopLevelWorldView().npcs())
+				{
+					if (npc == null || npc.getName() == null) continue;
+					if (!want.trim().equalsIgnoreCase(npc.getName())) continue;
+					WorldArea na = npc.getWorldArea();
+					if (na == null) continue;
+					if (na.getPlane() != playerArea.getPlane()) continue;
+					if (playerArea.distanceTo(na) <= 1)
+					{
+						active.completeStep(s.getId());
+						break;
+					}
+				}
+			}
+		}
+
+		// Clear the per-tick skilling flag last so ItemContainerChanged
+		// events that fire during this tick (server tick → inventory)
+		// can still see it.
+		skillingThisTick = false;
+
+		// Poll XP for active GAIN_XP steps. We sample every tick rather than
+		// reacting to StatChanged because StatChanged is not always fired for
+		// every XP gain (notably small/incremental gains can be coalesced).
+		pollXpProgress();
+	}
+
+	private void pollXpProgress()
+	{
+		// XP credit is only awarded while the hunt timer is actively running.
+		// Any pause/resume transition clears existing baselines so the next
+		// poll after resume re-anchors instead of crediting the gap.
+		boolean nowRunning = active.isTimerRunning();
+		if (nowRunning != wasTimerRunning)
+		{
+			stepXpBaselines.clear();
+			wasTimerRunning = nowRunning;
+		}
+		if (!nowRunning)
+		{
+			return;
+		}
+
+		for (PuzzleStep s : active.getActiveStepsForDetection())
+		{
+			if (s.getType() != ClueType.GAIN_XP) continue;
+			List<String> wantSkills = s.getXpSkills();
+			boolean anySkill = wantSkills == null || wantSkills.isEmpty();
+			Map<Skill, Integer> baseline = stepXpBaselines
+				.computeIfAbsent(s.getId(), k -> new HashMap<>());
+
+			int accum = stepCounters.getOrDefault(s.getId(), 0);
+			boolean changed = false;
+			for (Skill skill : Skill.values())
+			{
+				@SuppressWarnings("deprecation")
+				boolean isOverall = skill == Skill.OVERALL;
+				if (isOverall) continue;
+				if (!anySkill)
+				{
+					boolean match = false;
+					for (String name : wantSkills)
+					{
+						if (name != null && name.equalsIgnoreCase(skill.name())) { match = true; break; }
+					}
+					if (!match) continue;
+				}
+				int nowXp = client.getSkillExperience(skill);
+				Integer prev = baseline.get(skill);
+				if (prev == null)
+				{
+					baseline.put(skill, nowXp);
+					continue;
+				}
+				int delta = nowXp - prev;
+				if (delta <= 0) continue;
+				baseline.put(skill, nowXp);
+				accum += delta;
+				changed = true;
+			}
+			if (changed)
+			{
+				stepCounters.put(s.getId(), accum);
+				if (s.getXpAmount() > 0 && accum >= s.getXpAmount())
 				{
 					active.completeStep(s.getId());
-					break;
 				}
 			}
 		}
 	}
 
-	private static String safeName(String raw)
+	@Subscribe
+	public void onStatChanged(StatChanged event)
 	{
-		if (raw == null)
+		Skill skill = event.getSkill();
+		if (skill == null)
 		{
-			return "";
+			return;
 		}
-		// Strip RuneLite menu colour tags: <col=ffff00>Bones</col>
-		return raw.replaceAll("<[^>]*>", "");
-	}
-
-	/** Resets the inventory baseline; called when starting a new hunt. */
-	public synchronized void resetInventoryBaseline()
-	{
-		lastInventoryCounts.clear();
-		ItemContainer inv = client.getItemContainer(InventoryID.INVENTORY);
-		if (inv != null)
+		if (skill != Skill.HITPOINTS)
 		{
-			lastInventoryCounts.putAll(countItems(inv));
+			// Used to disambiguate skilling-sourced inventory gains from bank/shop withdrawals.
+			skillingThisTick = true;
 		}
 	}
 
-	// Simple value carriers returned to the eyedropper callback.
-	public static final class SelectedItem
+	private boolean isBankOpen()
 	{
-		public final int id;
-		public final String name;
-		public SelectedItem(int id, String name) { this.id = id; this.name = name == null ? "" : name; }
+		Widget w = client.getWidget(InterfaceID.Bankmain.UNIVERSE);
+		return w != null && !w.isHidden();
 	}
 
-	public static final class SelectedNpc
+	private boolean isShopOpen()
 	{
-		public final int id;
-		public final String name;
-		public SelectedNpc(int id, String name) { this.id = id; this.name = name == null ? "" : name; }
+		Widget w = client.getWidget(InterfaceID.Shopmain.UNIVERSE);
+		return w != null && !w.isHidden();
+	}
+
+	/** Resets the inventory baseline. Safe to call from any thread. */
+	public void resetInventoryBaseline()
+	{
+		clientThread.invoke(() ->
+		{
+			lastInventoryCounts.clear();
+			ItemContainer inv = client.getItemContainer(InventoryID.INV);
+			if (inv != null)
+			{
+				lastInventoryCounts.putAll(countItems(inv));
+			}
+		});
+	}
+
+	/** Resets all per-step accumulators. Call when starting/resetting a hunt. */
+	public void resetForNewHunt()
+	{
+		stepCounters.clear();
+		stepXpBaselines.clear();
+		wasTimerRunning = false;
+		resetInventoryBaseline();
+	}
+
+	/** Current accumulator value for a step (items gained, kc, gp, xp delta). */
+	public int getStepProgress(String stepId)
+	{
+		return stepCounters.getOrDefault(stepId, 0);
 	}
 }

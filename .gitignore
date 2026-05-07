@@ -7,3 +7,5 @@ build
 nbactions.xml
 nb-configuration.xml
 nbproject/
+build.log
+build-warnings.txt

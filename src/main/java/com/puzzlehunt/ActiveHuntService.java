@@ -216,18 +216,26 @@ public class ActiveHuntService
 
 		if (activeHunt.getMode() == HuntMode.TREASURE_TRAIL)
 		{
-			int idx = activeProgress.getCurrentStepIndex();
-			if (idx < 0 || idx >= steps.size())
+			// Step must be among the chapter-aware active set: it has to be in
+			// the current chapter, and (for sequential chapters) the first
+			// uncompleted step within it.
+			boolean allowed = false;
+			for (PuzzleStep s : computeActiveSteps())
 			{
-				return false;
+				if (s.getId().equals(stepId))
+				{
+					allowed = true;
+					break;
+				}
 			}
-			PuzzleStep current = steps.get(idx);
-			if (!current.getId().equals(stepId))
+			if (!allowed)
 			{
 				return false;
 			}
 			recordSplit(stepId);
-			activeProgress.setCurrentStepIndex(idx + 1);
+			// Maintain currentStepIndex as a hint to the first uncompleted step
+			// in source order, used by the UI for "future" masking fallbacks.
+			activeProgress.setCurrentStepIndex(firstUncompletedIndex(steps));
 		}
 		else
 		{
@@ -274,13 +282,78 @@ public class ActiveHuntService
 		{
 			return null;
 		}
-		List<PuzzleStep> steps = activeHunt.getSteps();
-		int idx = activeProgress.getCurrentStepIndex();
-		if (idx < 0 || idx >= steps.size())
+		List<PuzzleStep> active = computeActiveSteps();
+		return active.isEmpty() ? null : active.get(0);
+	}
+
+	/**
+	 * Lowest chapter index that still has uncompleted steps in a TREASURE_TRAIL
+	 * hunt. Returns -1 when there is no active hunt or every step is complete.
+	 * Always -1 in DIARY hunts (chapters are not used).
+	 */
+	public synchronized int getActiveChapter()
+	{
+		if (activeHunt == null || activeProgress == null || activeProgress.isCompleted())
 		{
-			return null;
+			return -1;
 		}
-		return steps.get(idx);
+		if (activeHunt.getMode() != HuntMode.TREASURE_TRAIL)
+		{
+			return -1;
+		}
+		java.util.Set<String> done = activeProgress.getStepSplits().keySet();
+		int min = Integer.MAX_VALUE;
+		for (PuzzleStep s : activeHunt.getSteps())
+		{
+			if (done.contains(s.getId())) continue;
+			if (s.getChapter() < min) min = s.getChapter();
+		}
+		return min == Integer.MAX_VALUE ? -1 : min;
+	}
+
+	/**
+	 * True when the given step belongs to a chapter strictly after the active
+	 * one (and so should be hidden from the player in TREASURE_TRAIL mode).
+	 */
+	public synchronized boolean isStepHidden(PuzzleStep step)
+	{
+		if (step == null || activeHunt == null) return false;
+		if (activeHunt.getMode() != HuntMode.TREASURE_TRAIL) return false;
+		int active = getActiveChapter();
+		if (active < 0) return false;
+		return step.getChapter() > active;
+	}
+
+	private List<PuzzleStep> computeActiveSteps()
+	{
+		List<PuzzleStep> steps = activeHunt.getSteps();
+		if (steps == null || steps.isEmpty()) return Collections.emptyList();
+		java.util.Set<String> done = activeProgress.getStepSplits().keySet();
+		int chapter = getActiveChapter();
+		if (chapter < 0) return Collections.emptyList();
+		HuntMode chapterMode = activeHunt.getChapterMode(chapter);
+		List<PuzzleStep> chapterSteps = new ArrayList<>();
+		for (PuzzleStep s : steps)
+		{
+			if (s.getChapter() == chapter && !done.contains(s.getId()))
+			{
+				chapterSteps.add(s);
+			}
+		}
+		if (chapterSteps.isEmpty()) return Collections.emptyList();
+		if (chapterMode == HuntMode.DIARY) return chapterSteps;
+		// Sequential within chapter: only the first uncompleted step is active.
+		return Collections.singletonList(chapterSteps.get(0));
+	}
+
+	private int firstUncompletedIndex(List<PuzzleStep> steps)
+	{
+		java.util.Set<String> done = activeProgress.getStepSplits().keySet();
+		for (int i = 0; i < steps.size(); i++)
+		{
+			if (!done.contains(steps.get(i).getId())) return i;
+		}
+		return steps.size();
 	}
 
 	/**
@@ -297,8 +370,7 @@ public class ActiveHuntService
 		List<PuzzleStep> steps = activeHunt.getSteps();
 		if (activeHunt.getMode() == HuntMode.TREASURE_TRAIL)
 		{
-			PuzzleStep current = getCurrentStep();
-			return current == null ? Collections.emptyList() : Collections.singletonList(current);
+			return computeActiveSteps();
 		}
 		List<PuzzleStep> out = new ArrayList<>();
 		for (PuzzleStep s : steps)

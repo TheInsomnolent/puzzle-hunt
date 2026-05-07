@@ -7,7 +7,9 @@ public class PuzzleHuntPluginTest
 {
 	public static void main(String[] args) throws Exception
 	{
-		ExternalPluginManager.loadBuiltin(PuzzleHuntPlugin.class);
+		@SuppressWarnings({"unchecked", "rawtypes"})
+		Class<? extends net.runelite.client.plugins.Plugin>[] plugins = new Class[] { PuzzleHuntPlugin.class };
+		ExternalPluginManager.loadBuiltin(plugins);
 		RuneLite.main(args);
 	}
 }

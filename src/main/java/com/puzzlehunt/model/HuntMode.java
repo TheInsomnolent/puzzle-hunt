@@ -12,6 +12,24 @@ package com.puzzlehunt.model;
  */
 public enum HuntMode
 {
-	TREASURE_TRAIL,
-	DIARY
+	TREASURE_TRAIL("Treasure Trail"),
+	DIARY("Diary");
+
+	private final String displayName;
+
+	HuntMode(String displayName)
+	{
+		this.displayName = displayName;
+	}
+
+	public String getDisplayName()
+	{
+		return displayName;
+	}
+
+	@Override
+	public String toString()
+	{
+		return displayName;
+	}
 }

@@ -4,6 +4,7 @@ import com.google.gson.Gson;
 import com.google.gson.JsonSyntaxException;
 import com.puzzlehunt.model.HuntProgress;
 import com.puzzlehunt.model.PuzzleHunt;
+import com.puzzlehunt.model.PuzzleStep;
 import java.io.BufferedReader;
 import java.io.BufferedWriter;
 import java.io.IOException;
@@ -65,6 +66,19 @@ public class HuntManager
 		this.progressDir = pluginDir.resolve(PROGRESS_DIR_NAME);
 	}
 
+	/** Deep-clones a {@link PuzzleStep} via the configured Gson and assigns
+	 * a fresh id so progress tracking treats it as a separate step. */
+	public PuzzleStep cloneStep(PuzzleStep src)
+	{
+		if (src == null)
+		{
+			return null;
+		}
+		PuzzleStep copy = gson.fromJson(gson.toJson(src), PuzzleStep.class);
+		copy.setId(java.util.UUID.randomUUID().toString());
+		return copy;
+	}
+
 	/** Loads every saved hunt. Corrupt files are skipped with a debug log. */
 	public List<PuzzleHunt> loadAllHunts()
 	{
@@ -120,9 +134,107 @@ public class HuntManager
 		Files.deleteIfExists(progressDir.resolve(safeFileName(huntId) + JSON_EXT));
 	}
 
-	/** Imports a hunt from arbitrary JSON content (e.g. one a friend shared). */
-	public PuzzleHunt importHunt(String json) throws IOException
+	private static final String EXAMPLES_RESOURCE_DIR = "/com/puzzlehunt/examples/";
+	private static final String EXAMPLES_MANIFEST = EXAMPLES_RESOURCE_DIR + "examples.txt";
+	private static final String BOOTSTRAP_MARKER = ".examples-bootstrapped";
+
+	/**
+	 * Imports the bundled example hunts the first time the plugin is run on
+	 * this machine. The marker file lives in {@link #pluginDir} so deleting
+	 * the plugin directory (a "reset") will cause the examples to be
+	 * re-installed on next start.
+	 *
+	 * <p>Safe to call from {@code startUp()}; failures are logged at debug and
+	 * never escape — a missing / malformed example must not stop the plugin
+	 * from loading.
+	 */
+	public void bootstrapExampleHuntsIfNeeded()
 	{
+		try
+		{
+			Files.createDirectories(pluginDir);
+			Path marker = pluginDir.resolve(BOOTSTRAP_MARKER);
+			if (Files.exists(marker))
+			{
+				return;
+			}
+			List<String> resourceNames = readExamplesManifest();
+			for (String name : resourceNames)
+			{
+				importBundledExample(name);
+			}
+			Files.write(marker, ("Examples installed at " + java.time.Instant.now() + System.lineSeparator())
+				.getBytes(StandardCharsets.UTF_8));
+		}
+		catch (IOException e)
+		{
+			log.debug("Failed to bootstrap example hunts", e);
+		}
+	}
+
+	private List<String> readExamplesManifest()
+	{
+		List<String> names = new ArrayList<>();
+		try (java.io.InputStream in = HuntManager.class.getResourceAsStream(EXAMPLES_MANIFEST))
+		{
+			if (in == null)
+			{
+				return names;
+			}
+			try (BufferedReader r = new BufferedReader(new java.io.InputStreamReader(in, StandardCharsets.UTF_8)))
+			{
+				String line;
+				while ((line = r.readLine()) != null)
+				{
+					String trimmed = line.trim();
+					if (trimmed.isEmpty() || trimmed.startsWith("#"))
+					{
+						continue;
+					}
+					names.add(trimmed);
+				}
+			}
+		}
+		catch (IOException e)
+		{
+			log.debug("Failed to read examples manifest", e);
+		}
+		return names;
+	}
+
+	private void importBundledExample(String resourceName)
+	{
+		String path = EXAMPLES_RESOURCE_DIR + resourceName;
+		try (java.io.InputStream in = HuntManager.class.getResourceAsStream(path))
+		{
+			if (in == null)
+			{
+				log.debug("Example resource missing: {}", path);
+				return;
+			}
+			byte[] raw = in.readAllBytes();
+			String content = new String(raw, StandardCharsets.UTF_8).trim();
+			if (content.isEmpty())
+			{
+				// Placeholder file with no code yet — skip silently.
+				return;
+			}
+			importHunt(content);
+		}
+		catch (IOException | IllegalArgumentException e)
+		{
+			log.debug("Failed to import bundled example {}", resourceName, e);
+		}
+	}
+
+	/**
+	 * Imports a hunt that may be either raw JSON or a base64-encoded JSON
+	 * string (whitespace-tolerant). Saves it under a fresh id if one isn't
+	 * already present.
+	 */
+	public PuzzleHunt importHunt(String content) throws IOException
+	{
+		String json = decodeIfBase64(content);
 		PuzzleHunt hunt;
 		try
 		{
@@ -144,6 +256,39 @@ public class HuntManager
 		}
 		saveHunt(hunt);
 		return hunt;
+	}
+
+	/** Serialises a hunt to a base64-encoded JSON string suitable for sharing. */
+	public String exportHunt(PuzzleHunt hunt)
+	{
+		String json = gson.toJson(hunt);
+		return java.util.Base64.getEncoder().encodeToString(json.getBytes(StandardCharsets.UTF_8));
+	}
+
+	private static String decodeIfBase64(String content)
+	{
+		if (content == null)
+		{
+			return "";
+		}
+		String trimmed = content.trim();
+		if (trimmed.startsWith("{"))
+		{
+			// Already JSON.
+			return trimmed;
+		}
+		// Strip surrounding whitespace and base64-decode.
+		String compact = trimmed.replaceAll("\\s+", "");
+		try
+		{
+			byte[] decoded = java.util.Base64.getDecoder().decode(compact);
+			return new String(decoded, StandardCharsets.UTF_8);
+		}
+		catch (IllegalArgumentException e)
+		{
+			// Fall through: maybe a mangled JSON file.
+			return trimmed;
+		}
 	}
 
 	/** Loads progress for the given hunt id, returning a fresh record if none exists. */
